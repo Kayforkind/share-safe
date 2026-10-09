@@ -19,7 +19,7 @@ Requires Node 20+. The only dependency is `pdf-lib`.
 Preview first. A dry run changes nothing:
 
 ```bash
-node clean-pdf.mjs contract.pdf --dry-run --md preview.md
+node clean-pdf.mjs examples/sample-dirty.pdf --dry-run --md preview.md
 ```
 
 ```
@@ -30,7 +30,7 @@ not checked: annotation authors, form field values, EXIF inside page images
 Then clean:
 
 ```bash
-node clean-pdf.mjs contract.pdf -o contract-share.pdf --report removed.json --md report.md
+node clean-pdf.mjs examples/sample-dirty.pdf -o contract-share.pdf --report removed.json --md report.md
 ```
 
 See [`examples/`](examples/) for a sample input, its dry-run preview, and the report it produces.
