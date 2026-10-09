@@ -1,0 +1,21 @@
+{
+  "removed": {
+    "info": [
+      "Title",
+      "Author",
+      "Creator",
+      "Producer",
+      "CreationDate",
+      "ModDate"
+    ],
+    "xmp": false,
+    "attachments": 1,
+    "javascript": 0
+  },
+  "verified": true,
+  "notChecked": [
+    "annotation authors",
+    "form field values",
+    "EXIF inside page images"
+  ]
+}
