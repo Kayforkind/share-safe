@@ -33,6 +33,17 @@ Then clean:
 node clean-pdf.mjs examples/sample-dirty.pdf -o contract-share.pdf --report removed.json --md report.md
 ```
 
+### Batch
+
+Pass several files with `--out-dir`. Each cleaned file keeps its name, and the Markdown report has one section per file:
+
+```bash
+node clean-pdf.mjs contracts/*.pdf --out-dir contracts-clean --md batch.md
+node clean-pdf.mjs contracts/*.pdf --dry-run --md preview.md
+```
+
+The tool refuses to write over an input file. A batch exits with the worst code of any file.
+
 See [`examples/`](examples/) for a sample input, its dry-run preview, and the report it produces.
 
 | Exit | Meaning |

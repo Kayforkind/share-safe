@@ -14,11 +14,16 @@
  * Not covered yet: per-page annotation authors, form field values, and image
  * EXIF inside the page content. Those are listed in the report as NOT CHECKED.
  *
- * Usage: share-safe in.pdf -o out.pdf [--report out.json] [--md out.md]
- *        share-safe in.pdf --dry-run [--md out.md]
+ * Usage:
+ *   share-safe in.pdf -o out.pdf [--report out.json] [--md out.md]
+ *   share-safe in.pdf --dry-run [--md out.md]
+ *   share-safe a.pdf b.pdf ... --out-dir clean/ [--md out.md]     # batch; same file names
+ *   share-safe a.pdf b.pdf ... --dry-run [--md out.md]           # batch preview
  * Exit: 0 cleaned and verified (or dry run) · 1 verification failed · 2 usage or read error
+ * (batch: the worst code across files)
  */
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
+import { basename, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef } from 'pdf-lib';
 
@@ -127,29 +132,24 @@ function setExit(code) {
   return code;
 }
 
-async function main(argv) {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    allowPositionals: true,
-    options: {
-      o: { type: 'string', short: 'o' },
-      report: { type: 'string' },
-      md: { type: 'string' },
-      'dry-run': { type: 'boolean' },
-      help: { type: 'boolean', short: 'h' },
-    },
-  });
-  const input = positionals[0];
-  if (values.help || !input || (!values.o && !values['dry-run'])) {
-    console.log('usage: share-safe in.pdf -o out.pdf [--report out.json] [--md out.md]\n       share-safe in.pdf --dry-run [--md out.md]');
-    return setExit(values.help ? 0 : 2);
-  }
+const USAGE = [
+  'usage: share-safe in.pdf -o out.pdf [--report out.json] [--md out.md]',
+  '       share-safe in.pdf --dry-run [--md out.md]',
+  '       share-safe a.pdf b.pdf ... --out-dir clean/ [--md out.md]',
+  '       share-safe a.pdf b.pdf ... --dry-run [--md out.md]',
+].join('\n');
+
+const summaryLine = (r) => `info=[${r.info.join(', ') || '-'}] xmp=${r.xmp} attachments=${r.attachments} javascript=${r.javascript}`;
+
+/** Clean or inspect one file. Returns an exit code and, on success, the Markdown section. */
+async function processOne(input, values, batch) {
+  const label = batch ? `${input}: ` : '';
   let bytes;
   try {
     bytes = new Uint8Array(readFileSync(input));
   } catch (e) {
     console.error(`cannot read ${input}: ${e.message}`);
-    return setExit(2);
+    return { code: 2 };
   }
 
   if (values['dry-run']) {
@@ -157,32 +157,81 @@ async function main(argv) {
     try {
       report = await inspectPdf(bytes);
     } catch (e) {
-      console.error(`cannot read PDF: ${e.message}`);
-      return setExit(2);
+      console.error(`${label}cannot read PDF: ${e.message}`);
+      return { code: 2 };
     }
-    if (values.md) writeFileSync(values.md, toMarkdown(report, { dryRun: true }));
-    const r = report.removed;
-    console.log(`would remove: info=[${r.info.join(', ') || '-'}] xmp=${r.xmp} attachments=${r.attachments} javascript=${r.javascript}`);
-    console.log(`not checked: ${report.notChecked.join(', ')}`);
-    return setExit(0);
+    console.log(`${label}would remove: ${summaryLine(report.removed)}`);
+    console.log(`${label}not checked: ${report.notChecked.join(', ')}`);
+    return { code: 0, md: toMarkdown(report, { dryRun: true }) };
   }
 
+  const outPath = values['out-dir'] ? join(values['out-dir'], basename(input)) : values.o;
+  if (resolve(outPath) === resolve(input)) {
+    console.error(`${label}refusing to overwrite the input file`);
+    return { code: 2 };
+  }
   let result;
   try {
     result = await cleanPdf(bytes);
   } catch (e) {
-    console.error(`cannot clean: ${e.message}`);
-    return setExit(e.message.startsWith('verification') ? 1 : 2);
+    console.error(`${label}cannot clean: ${e.message}`);
+    return { code: e.message.startsWith('verification') ? 1 : 2 };
   }
-  writeFileSync(values.o, result.bytes);
-  if (values.report) writeFileSync(values.report, JSON.stringify(result.report, null, 2) + '\n');
-  if (values.md) writeFileSync(values.md, toMarkdown(result.report, { dryRun: false }));
-  const r = result.report.removed;
-  console.log(`cleaned: info=[${r.info.join(', ') || '-'}] xmp=${r.xmp} attachments=${r.attachments} javascript=${r.javascript}`);
-  console.log(`not checked: ${result.report.notChecked.join(', ')}`);
-  return setExit(0);
+  writeFileSync(outPath, result.bytes);
+  console.log(`${label}cleaned: ${summaryLine(result.report.removed)}`);
+  console.log(`${label}not checked: ${result.report.notChecked.join(', ')}`);
+  return { code: 0, md: toMarkdown(result.report, { dryRun: false }), report: result.report };
+}
+
+async function main(argv) {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    allowPositionals: true,
+    options: {
+      o: { type: 'string', short: 'o' },
+      'out-dir': { type: 'string' },
+      report: { type: 'string' },
+      md: { type: 'string' },
+      'dry-run': { type: 'boolean' },
+      help: { type: 'boolean', short: 'h' },
+    },
+  });
+  const inputs = positionals;
+  const batch = inputs.length > 1 || values['out-dir'] !== undefined;
+  if (values.help || inputs.length === 0 || (!values.o && !values['dry-run'] && !values['out-dir'])) {
+    console.log(USAGE);
+    return setExit(values.help ? 0 : 2);
+  }
+  if (values.o && batch) {
+    console.error('-o takes one input; use --out-dir for several');
+    return setExit(2);
+  }
+  if (values['out-dir'] && values['dry-run']) {
+    console.error('--out-dir and --dry-run cannot be combined');
+    return setExit(2);
+  }
+  if (batch && values.report) {
+    console.error('--report is for a single file; use --md for a batch summary');
+    return setExit(2);
+  }
+  if (values['out-dir']) mkdirSync(values['out-dir'], { recursive: true });
+
+  const mdParts = [];
+  let worst = 0;
+  for (const input of inputs) {
+    const r = await processOne(input, values, batch);
+    worst = Math.max(worst, r.code);
+    if (r.md) mdParts.push(r.md);
+    if (r.report && values.report) writeFileSync(values.report, JSON.stringify(r.report, null, 2) + '\n');
+  }
+  if (values.md && mdParts.length) writeFileSync(values.md, mdParts.join('\n---\n\n'));
+  return setExit(worst);
 }
 
 if (process.argv[1]?.endsWith('clean-pdf.mjs')) {
-  main(process.argv.slice(2));
+  // Unexpected errors and usage errors exit 2 with a one-line message, never a stack trace.
+  main(process.argv.slice(2)).catch((e) => {
+    console.error(e.message);
+    setExit(2);
+  });
 }
