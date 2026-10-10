@@ -22,12 +22,63 @@
  * Exit: 0 cleaned and verified (or dry run) · 1 verification failed · 2 usage or read error
  * (batch: the worst code across files)
  */
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { basename, join, resolve } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, statSync, existsSync, realpathSync, lstatSync } from 'node:fs';
+import { pathToFileURL } from 'node:url';
+import { basename, join, resolve, dirname } from 'node:path';
 import { parseArgs } from 'node:util';
-import { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef } from 'pdf-lib';
+import { PDFDocument, PDFName, PDFDict, PDFArray, PDFRef, PDFStream } from 'pdf-lib';
 
-const INFO_KEYS = ['Title', 'Author', 'Subject', 'Keywords', 'Creator', 'Producer', 'CreationDate', 'ModDate'];
+const REMOVE_KEYS = ['Metadata', 'EmbeddedFiles', 'JavaScript', 'JS', 'AA', 'OpenAction', 'AF', 'EF'];
+// /A is also used by structure attributes and font glyph maps. Only remove actions.
+function hasAction(doc, dict) {
+  const value = dict.get(PDFName.of('A'));
+  const action = value instanceof PDFRef ? doc.context.lookup(value) : value;
+  return action instanceof PDFDict && action.get(PDFName.of('S')) instanceof PDFName;
+}
+const safeText = (s) => String(s).replace(/[\x00-\x1f\x7f]/g, ' ').replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' })[c]).replace(/([\\|`*_\[\]])/g, '\\$1');
+const MAX_BYTES = 25 * 1024 * 1024;
+function checkBytes(bytes) {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength > MAX_BYTES) throw new Error('PDF input must be bytes under 25 MiB');
+}
+
+function allDicts(doc) {
+  const seen = new Set();
+  const dicts = [];
+  const stack = [doc.catalog, doc.getInfoDict(), ...doc.context.enumerateIndirectObjects().map(([, obj]) => obj)];
+  while (stack.length) {
+    const obj = stack.pop();
+    if (!obj || seen.has(obj)) continue;
+    seen.add(obj);
+    if (obj instanceof PDFStream) stack.push(obj.dict);
+    if (obj instanceof PDFDict) {
+      dicts.push(obj);
+      for (const [, value] of obj.entries()) if (!(value instanceof PDFRef)) stack.push(value);
+    }
+    if (obj instanceof PDFArray) for (let i = 0; i < obj.size(); i++) if (!(obj.get(i) instanceof PDFRef)) stack.push(obj.get(i));
+  }
+  return dicts;
+}
+
+// pdf-lib serializes orphan objects too. Retain only the post-scrub reachable graph.
+function pruneOrphans(doc) {
+  const visited = new Set();
+  const refs = new Set();
+  const stack = [doc.context.trailerInfo.Root, doc.context.trailerInfo.Info];
+  while (stack.length) {
+    const obj = stack.pop();
+    if (!obj || visited.has(obj)) continue;
+    visited.add(obj);
+    if (obj instanceof PDFRef) {
+      refs.add(obj.toString());
+      const target = doc.context.lookup(obj);
+      if (!target) throw new Error('verification failed: dangling PDF reference');
+      stack.push(target);
+    } else if (obj instanceof PDFStream) stack.push(obj.dict);
+    else if (obj instanceof PDFDict) for (const [, value] of obj.entries()) stack.push(value);
+    else if (obj instanceof PDFArray) for (let i = 0; i < obj.size(); i++) stack.push(obj.get(i));
+  }
+  for (const [ref] of doc.context.enumerateIndirectObjects()) if (!refs.has(ref.toString())) doc.context.delete(ref);
+}
 
 function namesDict(doc) {
   const names = doc.catalog.get(PDFName.of('Names'));
@@ -39,7 +90,8 @@ function namesDict(doc) {
 function present(doc) {
   const found = { info: [], xmp: false, attachments: 0, javascript: 0 };
   const info = doc.getInfoDict();
-  for (const k of INFO_KEYS) if (info.get(PDFName.of(k))) found.info.push(k);
+  found.info = info.keys().map((k) => k.decodeText());
+  found.activeContent = allDicts(doc).reduce((n, dict) => n + REMOVE_KEYS.filter((k) => dict.has(PDFName.of(k))).length + Number(hasAction(doc, dict)), 0);
   found.xmp = !!doc.catalog.get(PDFName.of('Metadata'));
   const names = namesDict(doc);
   if (names) {
@@ -50,24 +102,33 @@ function present(doc) {
   return found;
 }
 
-function countNameTree(doc, node, depth = 0) {
-  if (depth > 50) return 0;
+function countNameTree(doc, node, depth = 0, seen = new Set()) {
+  if (depth > 50) throw new Error('attachment tree exceeds depth limit');
   const n = node instanceof PDFRef ? doc.context.lookup(node) : node;
   if (!(n instanceof PDFDict)) return 0;
+  if (seen.has(n)) throw new Error('cyclic attachment tree');
+  seen.add(n);
   let count = 0;
-  const names = n.get(PDFName.of('Names'));
+  const names = doc.context.lookup(n.get(PDFName.of('Names')));
   if (names instanceof PDFArray) count += Math.floor(names.size() / 2);
-  const kids = n.get(PDFName.of('Kids'));
-  if (kids instanceof PDFArray) for (let i = 0; i < kids.size(); i++) count += countNameTree(doc, kids.get(i), depth + 1);
+  const kids = doc.context.lookup(n.get(PDFName.of('Kids')));
+  if (kids instanceof PDFArray) for (let i = 0; i < kids.size(); i++) count += countNameTree(doc, kids.get(i), depth + 1, seen);
   return count;
 }
 
 export async function cleanPdf(bytes) {
-  const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+  checkBytes(bytes);
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false, throwOnInvalidObject: true });
   const before = present(doc);
 
   const info = doc.getInfoDict();
-  for (const k of INFO_KEYS) info.delete(PDFName.of(k));
+  for (const k of info.keys()) info.delete(k);
+  for (const dict of allDicts(doc)) {
+    for (const k of REMOVE_KEYS) dict.delete(PDFName.of(k));
+    if (hasAction(doc, dict)) dict.delete(PDFName.of('A'));
+  }
+  delete doc.context.trailerInfo.ID;
+  pruneOrphans(doc);
   doc.catalog.delete(PDFName.of('Metadata'));
   const names = namesDict(doc);
   if (names) {
@@ -85,6 +146,7 @@ export async function cleanPdf(bytes) {
   if (after.xmp) leftovers.push('XMP metadata');
   if (after.attachments) leftovers.push(`${after.attachments} attachment(s)`);
   if (after.javascript) leftovers.push('JavaScript');
+  if (after.activeContent) leftovers.push('active content or hidden-data references');
   if (leftovers.length) throw new Error(`verification failed, output not released: ${leftovers.join('; ')}`);
 
   return {
@@ -99,7 +161,8 @@ export async function cleanPdf(bytes) {
 
 /** What a cleaner would remove, without changing anything. Used by --dry-run. */
 export async function inspectPdf(bytes) {
-  const doc = await PDFDocument.load(bytes, { updateMetadata: false });
+  checkBytes(bytes);
+  const doc = await PDFDocument.load(bytes, { updateMetadata: false, throwOnInvalidObject: true });
   return { removed: present(doc), notChecked: ['annotation authors', 'form field values', 'EXIF inside page images'] };
 }
 
@@ -110,15 +173,16 @@ export function toMarkdown(report, { dryRun }) {
     ['XMP metadata', r.xmp ? 'present' : 'none'],
     ['Embedded attachments', String(r.attachments)],
     ['JavaScript', r.javascript ? 'present' : 'none'],
+    ['Active/hidden-content references', String(r.activeContent)],
   ];
   const lines = [
     `# share-safe ${dryRun ? 'dry run' : 'report'}`,
     '',
     '| Hidden data | Found |',
     '| --- | --- |',
-    ...rows.map(([k, v]) => `| ${k} | ${v} |`),
+    ...rows.map(([k, v]) => `| ${safeText(k)} | ${safeText(v)} |`),
     '',
-    `**Verified clean:** ${dryRun ? 'not applicable (dry run)' : report.verified ? 'yes, re-opened and re-checked' : 'no'}`,
+    `**Selected removals verified:** ${dryRun ? 'not applicable (dry run)' : report.verified ? 'yes, re-opened and re-checked' : 'no'}`,
     '',
     '**Not checked (review manually):** ' + report.notChecked.join(', '),
     '',
@@ -139,13 +203,14 @@ const USAGE = [
   '       share-safe a.pdf b.pdf ... --dry-run [--md out.md]',
 ].join('\n');
 
-const summaryLine = (r) => `info=[${r.info.join(', ') || '-'}] xmp=${r.xmp} attachments=${r.attachments} javascript=${r.javascript}`;
+const summaryLine = (r) => `info=[${r.info.map(safeText).join(', ') || '-'}] xmp=${r.xmp} attachments=${r.attachments} javascript=${r.javascript}`;
 
 /** Clean or inspect one file. Returns an exit code and, on success, the Markdown section. */
 async function processOne(input, values, batch) {
   const label = batch ? `${input}: ` : '';
   let bytes;
   try {
+    if (!statSync(input).isFile() || statSync(input).size > MAX_BYTES) throw new Error('input must be a regular file under 25 MiB');
     bytes = new Uint8Array(readFileSync(input));
   } catch (e) {
     console.error(`cannot read ${input}: ${e.message}`);
@@ -177,7 +242,7 @@ async function processOne(input, values, batch) {
     console.error(`${label}cannot clean: ${e.message}`);
     return { code: e.message.startsWith('verification') ? 1 : 2 };
   }
-  writeFileSync(outPath, result.bytes);
+  writeFileSync(outPath, result.bytes, { flag: 'wx', mode: 0o600 });
   console.log(`${label}cleaned: ${summaryLine(result.report.removed)}`);
   console.log(`${label}not checked: ${result.report.notChecked.join(', ')}`);
   return { code: 0, md: toMarkdown(result.report, { dryRun: false }), report: result.report };
@@ -214,6 +279,23 @@ async function main(argv) {
     console.error('--report is for a single file; use --md for a batch summary');
     return setExit(2);
   }
+  if (values['dry-run'] && values.o) throw new Error('-o and --dry-run cannot be combined');
+  const canonicalTarget = (p) => {
+    const abs = resolve(p);
+    if (existsSync(abs)) return realpathSync(abs);
+    // Catch symlinked parent directories even for not-yet-created files.
+    const parent = dirname(abs);
+    return parent === abs ? abs : join(canonicalTarget(parent), basename(abs));
+  };
+  const inputPaths = inputs.map(canonicalTarget);
+  const outputPaths = [values.report, values.md, ...(!values['dry-run'] ? inputs.map((input) => values['out-dir'] ? join(values['out-dir'], basename(input)) : values.o) : [])].filter(Boolean);
+  const targets = outputPaths.map(canonicalTarget);
+  const normalized = targets.map((p) => process.platform === 'win32' ? p.toLowerCase() : p);
+  if (targets.some((p) => inputPaths.includes(p))) throw new Error('refusing to overwrite the input file');
+  if (new Set(normalized).size !== normalized.length) throw new Error('output paths collide (including duplicate batch filenames)');
+  for (const p of outputPaths) {
+    try { lstatSync(p); throw new Error('output already exists; refusing to overwrite'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+  }
   if (values['out-dir']) mkdirSync(values['out-dir'], { recursive: true });
 
   const mdParts = [];
@@ -222,13 +304,13 @@ async function main(argv) {
     const r = await processOne(input, values, batch);
     worst = Math.max(worst, r.code);
     if (r.md) mdParts.push(r.md);
-    if (r.report && values.report) writeFileSync(values.report, JSON.stringify(r.report, null, 2) + '\n');
+    if (r.report && values.report) writeFileSync(values.report, JSON.stringify(r.report, null, 2) + '\n', { flag: 'wx', mode: 0o600 });
   }
-  if (values.md && mdParts.length) writeFileSync(values.md, mdParts.join('\n---\n\n'));
+  if (values.md && mdParts.length) writeFileSync(values.md, mdParts.join('\n---\n\n'), { flag: 'wx', mode: 0o600 });
   return setExit(worst);
 }
 
-if (process.argv[1]?.endsWith('clean-pdf.mjs')) {
+if (process.argv[1] && import.meta.url === pathToFileURL(realpathSync(process.argv[1])).href) {
   // Unexpected errors and usage errors exit 2 with a one-line message, never a stack trace.
   main(process.argv.slice(2)).catch((e) => {
     console.error(e.message);

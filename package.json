@@ -1,12 +1,34 @@
 {
   "name": "share-safe",
-  "version": "1.1.0",
-  "description": "Strip hidden data from a PDF before you share it: document info, XMP, attachments, JavaScript. Re-checks the output and reports what it could not check.",
+  "version": "1.1.2",
+  "description": "Strip selected metadata/actions from PDFs and recheck output. Not anonymization, redaction or malware scanning.",
   "type": "module",
-  "bin": { "share-safe": "clean-pdf.mjs" },
-  "scripts": { "test": "node --test clean-pdf.test.mjs" },
-  "engines": { "node": ">=20" },
-  "dependencies": { "pdf-lib": "^1.17.1" },
-  "keywords": ["pdf", "metadata", "privacy", "redaction", "cli"],
-  "license": "MIT"
+  "bin": {
+    "share-safe": "clean-pdf.mjs"
+  },
+  "scripts": {
+    "test": "node --test clean-pdf.test.mjs",
+    "verify": "node --check clean-pdf.mjs && npm test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "pdf-lib": "^1.17.1"
+  },
+  "keywords": [
+    "pdf",
+    "metadata",
+    "privacy",
+    "redaction",
+    "cli"
+  ],
+  "license": "MIT",
+  "files": [
+    "clean-pdf.mjs",
+    "examples/",
+    "demo/",
+    "SECURITY.md",
+    "LICENSE"
+  ]
 }

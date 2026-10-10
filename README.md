@@ -1,4 +1,6 @@
-# share-safe
+# share-safe 1.1.2
+
+> Remove selected PDF metadata and actions, then verify the saved output. Not complete anonymization or content redaction.
 
 **Strip the hidden data from a PDF before you send it.**
 
@@ -42,7 +44,7 @@ node clean-pdf.mjs contracts/*.pdf --out-dir contracts-clean --md batch.md
 node clean-pdf.mjs contracts/*.pdf --dry-run --md preview.md
 ```
 
-The tool refuses to write over an input file. A batch exits with the worst code of any file.
+The tool refuses to overwrite any existing output or input, including aliases and report paths. Duplicate batch filenames and collisions between output/report paths are rejected before processing. Choose a new output folder for each run. A batch exits with the worst code of any file; successful earlier files remain if a later file fails.
 
 See [`examples/`](examples/) for a sample input, its dry-run preview, and the report it produces.
 
@@ -54,10 +56,11 @@ See [`examples/`](examples/) for a sample input, its dry-run preview, and the re
 
 ## What it removes
 
-- **Document info:** Title, Author, Subject, Keywords, Creator, Producer, creation and modification dates
-- **XMP metadata:** the catalog's metadata stream
-- **Embedded files:** attachments in the names tree
-- **Document JavaScript:** scripts in the names tree
+- **Document info:** all keys, including custom fields; trailer document identifiers
+- **XMP metadata:** metadata references in dictionaries throughout the PDF
+- **Embedded files:** names-tree attachments, associated-file and embedded-file references
+- **Active actions:** JavaScript, open/additional actions and action references throughout dictionaries (including link actions). `/A` is removed only when it resolves to an action dictionary; legitimate structure attributes and font glyph mappings are preserved.
+- **Orphan objects:** objects no longer reachable after removal, so detached attachment/script payload objects are not serialized into the cleaned file
 
 After saving, it re-opens the output and checks each of these. If anything is left, it throws and does not release the file.
 
@@ -74,7 +77,9 @@ Removing EXIF from embedded images would need a re-encode of each image. That is
 ## Limits
 
 - Cleaning changes the file. Digital signatures on the original are invalidated by any save. Sign the cleaned copy instead.
-- pdf-lib writes its own `Producer` on save, so the output may show a generic producer after the cleaner runs.
+- Action removal disables interactive links and action-driven behavior. Save invalidates signatures; verify the visible pages and expected behavior before sending.
+- Inputs are limited to regular PDFs under 25 MiB. This is not a parser sandbox; hostile compressed PDFs still need OS memory/time limits.
+- `verified` means the listed removals were rechecked, not malware clearance, complete anonymization or content redaction. Visible text, forms, annotation contents, rich media and image payloads can still disclose data.
 - Encrypted PDFs need their password first. The cleaner does not try to open them.
 
 ## Development
@@ -86,3 +91,7 @@ npm test
 ## License
 
 MIT
+
+## Release verification
+
+Use a supported Node LTS (22 or 24). Run `npm ci --ignore-scripts` followed by `npm run verify`. The security workflow runs the regression suite on Linux and Windows; it has not yet been executed remotely for this local change. New report/output files are created exclusively; choose fresh filenames or output folders for repeat runs. See [SECURITY.md](SECURITY.md) for the threat model and disclosure guidance.
